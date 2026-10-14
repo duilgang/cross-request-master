@@ -1,5 +1,12 @@
 'use strict';
 
+// 引入浏览器API兼容层
+try {
+  importScripts('src/browser-api-adapter.js');
+} catch (e) {
+  console.warn('[Background] API适配器加载失败:', e);
+}
+
 let safeLogResponse = null;
 let sanitizeRequestHeaders = null;
 
@@ -327,7 +334,11 @@ async function handleCrossOriginRequest(request) {
       // 判断错误类型
       if (fetchError.message.includes('net::ERR_CONNECTION_REFUSED')) {
         throw new Error(
-          `无法连接到服务器 ${url}\n请确认：\n1. 服务器是否已启动\n2. 端口是否正确\n3. 防火墙设置`
+          `无法连接到服务器 ${url}
+请确认：
+1. 服务器是否已启动
+2. 端口是否正确
+3. 防火墙设置`
         );
       } else if (fetchError.message.includes('net::ERR_NAME_NOT_RESOLVED')) {
         throw new Error(`无法解析域名 ${url}\n请检查域名是否正确`);

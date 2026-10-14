@@ -17,7 +17,7 @@ document.addEventListener('DOMContentLoaded', () => {
   console.log('[Popup] DOM 元素获取完成');
 
   // 强制设置允许所有域名（后台处理）
-  chrome.storage.local.set({ allowedDomains: ['*'] }, () => {
+  (chrome || browser).storage.local.set({ allowedDomains: ['*'] }, () => {
     console.log('[Popup] 已设置允许所有域名');
     showStatus('扩展已启用，支持所有域名跨域请求', 'success');
   });
