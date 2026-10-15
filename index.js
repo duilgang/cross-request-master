@@ -359,6 +359,54 @@
           console.warn('[Index] 旧版 files/file 参数转换失败:', e.message);
         }
       }
+
+      // 主动补充：YApi 可能跳过了文件字段，但如果 body 是普通对象且 DOM 中有文件输入，自动升级为 FormData
+      if (
+        isYapiContext() &&
+        data &&
+        typeof data === 'object' &&
+        !(typeof FormData !== 'undefined' && data instanceof FormData) &&
+        method !== 'GET' &&
+        method !== 'HEAD'
+      ) {
+        try {
+          const postmanRoot = document.querySelector('.interface-test.postman');
+          if (postmanRoot) {
+            const fileInputs = postmanRoot.querySelectorAll('input[type="file"]');
+            let hasSelectedFiles = false;
+            const formDataEnhanced = new FormData();
+
+            // 先加入原始 data 中的文本字段
+            Object.keys(data).forEach((key) => {
+              const val = data[key];
+              if (val !== undefined && val !== null) {
+                formDataEnhanced.append(key, typeof val === 'object' ? JSON.stringify(val) : String(val));
+              }
+            });
+
+            // 再加入文件字段
+            fileInputs.forEach((fi) => {
+              if (fi.files && fi.files.length > 0) {
+                const row = fi.closest('.ant-row') || fi.closest('.key-value-wrap') || fi.parentElement;
+                const nameInput = row && (row.querySelector('input[disabled]') || row.querySelector('input:not([type="file"])'));
+                const fieldName = nameInput ? (nameInput.value || '').trim() : '';
+                if (fieldName) {
+                  formDataEnhanced.append(fieldName, fi.files[0], fi.files[0].name);
+                  hasSelectedFiles = true;
+                }
+              }
+            });
+
+            if (hasSelectedFiles) {
+              data = formDataEnhanced;
+              debugLog('[Index] 主动补充文件字段，已升级为 FormData');
+            }
+          }
+        } catch (e) {
+          // 不影响原有流程
+          debugLog('[Index] 文件字段自动补充失败（忽略）:', e.message);
+        }
+      }
       let url = options.url;
       let body = data;
 
@@ -1634,6 +1682,309 @@
     } else {
       debugLog('[Cross-Request] jQuery.ajax 已扩展（默认拦截模式）');
     }
+  }
+
+  // 标记支持文件上传（供 YApi 前台检测）
+  win.crossRequest.supportFileUpload = true;
+
+  // ==========================================================
+  // YApi form-data 文件上传拦截器
+  // 解决：YApi 前端在 form-data 含 file 类型字段时显示
+  // "因Chrome最新版安全策略限制，不再支持文件上传" 并阻止请求
+  // ==========================================================
+  if (isYapiContext()) {
+    const FILE_UPLOAD_ERROR_TEXTS = [
+      '不再支持文件上传',
+      '安全策略限制',
+      '不支持文件上传'
+    ];
+
+    const isFileUploadError = (el) => {
+      const text = (el.textContent || '').trim();
+      return FILE_UPLOAD_ERROR_TEXTS.some((keyword) => text.includes(keyword));
+    };
+
+    const extractRequestConfigFromYapiDom = () => {
+      const root = document.querySelector('.interface-test.postman');
+      if (!root) return null;
+
+      // URL
+      const urlBar = root.querySelector('.url');
+      const urlInput = urlBar && urlBar.querySelector('input.ant-input');
+      const url = urlInput ? urlInput.value.trim() : '';
+      if (!url) return null;
+
+      // Method (from select or button near URL)
+      let method = 'POST';
+      const methodSelect = urlBar && urlBar.querySelector('.ant-select-selection-selected-value');
+      if (methodSelect) {
+        method = (methodSelect.textContent || '').trim().toUpperCase() || 'POST';
+      } else {
+        const methodBtn = urlBar && urlBar.querySelector('.ant-btn-primary + .ant-select .ant-select-selection__rendered');
+        if (methodBtn) method = (methodBtn.textContent || '').trim().toUpperCase() || 'POST';
+      }
+
+      // Headers from the header section
+      const headers = {};
+      const collapseItems = Array.from(root.querySelectorAll('.ant-collapse-item'));
+      const headerItem = collapseItems.find((el) => {
+        const header = el.querySelector('.ant-collapse-header');
+        const text = header ? (header.textContent || '').replace(/\s+/g, '').toLowerCase() : '';
+        return text.includes('header') || text.includes('请求头');
+      });
+      if (headerItem) {
+        const rows = headerItem.querySelectorAll('.ant-row');
+        rows.forEach((row) => {
+          const inputs = row.querySelectorAll('input');
+          if (inputs.length >= 2) {
+            const key = (inputs[0].value || '').trim();
+            const val = (inputs[1].value || '').trim();
+            if (key && !key.includes('请输入')) {
+              headers[key] = val;
+            }
+          }
+        });
+      }
+
+      // Build FormData from body form fields
+      const bodyItem = collapseItems.find((el) => {
+        const header = el.querySelector('.ant-collapse-header');
+        const text = header ? (header.textContent || '').replace(/\s+/g, '').toLowerCase() : '';
+        return text.includes('body') || text.includes('请求体');
+      });
+
+      const formData = new FormData();
+      let hasFileFields = false;
+      const processedFileInputs = new Set();
+
+      // 尝试获取字段名（从 disabled input 或同一行的 input）
+      const resolveFieldName = (row) => {
+        if (!row) return '';
+        const disabledInput = row.querySelector('input[disabled]');
+        if (disabledInput) return (disabledInput.value || '').trim();
+        const nameInput = row.querySelector('input:not([type="file"])');
+        return nameInput ? (nameInput.value || '').trim() : '';
+      };
+
+      if (bodyItem) {
+        // Find form-type table rows
+        const formRows = bodyItem.querySelectorAll('.key-value-wrap, .ant-row');
+        formRows.forEach((row) => {
+          const fileInput = row.querySelector('input[type="file"]');
+          if (fileInput && fileInput.files && fileInput.files.length > 0) {
+            processedFileInputs.add(fileInput);
+            const fieldName = resolveFieldName(row);
+            if (fieldName) {
+              const file = fileInput.files[0];
+              formData.append(fieldName, file, file.name);
+              hasFileFields = true;
+            }
+          } else {
+            // Text field: disabled input = name, enabled input = value
+            const disabledInputs = row.querySelectorAll('input[disabled]');
+            const enabledInputs = Array.from(row.querySelectorAll('input:not([disabled]):not([type="file"])'));
+            if (enabledInputs.length >= 1 && disabledInputs.length >= 1) {
+              const key = (disabledInputs[0].value || '').trim();
+              const val = (enabledInputs[0].value || '').trim();
+              if (key && val) {
+                formData.append(key, val);
+              }
+            }
+          }
+        });
+      }
+
+      // 兜底：扫描整个面板中未被处理的文件输入
+      const allFileInputs = (bodyItem || root).querySelectorAll('input[type="file"]');
+      allFileInputs.forEach((fi) => {
+        if (fi.files && fi.files.length > 0 && !processedFileInputs.has(fi)) {
+          const row = fi.closest('.ant-row') || fi.closest('.key-value-wrap') || fi.parentElement;
+          const fieldName = resolveFieldName(row);
+          if (fieldName) {
+            const file = fi.files[0];
+            formData.append(fieldName, file, file.name);
+            hasFileFields = true;
+          }
+        }
+      });
+
+      if (!hasFileFields) return null;
+
+      return { url, method, headers, formData };
+    };
+
+    const performFileUpload = (config) => {
+      debugLog('[Index] 自动执行文件上传请求:', config.url);
+
+      // 使用已有的 crossRequest 管道（包含序列化逻辑）
+      const requestData = {
+        url: toAbsoluteUrl(config.url),
+        method: config.method,
+        headers: applyFixedHeaders(config.headers),
+        body: config.formData,
+        timeout: 60000 // 文件上传超时给更长
+      };
+
+      CrossRequestAPI.request(requestData)
+        .then((response) => {
+          debugLog('[Index] 文件上传响应:', response.status);
+          // 在 YApi 响应区域显示结果
+          displayFileUploadResponse(response);
+        })
+        .catch((error) => {
+          console.error('[Index] 文件上传失败:', error.message);
+          displayFileUploadError(error.message);
+        });
+    };
+
+    const displayFileUploadResponse = (response) => {
+      const root = document.querySelector('.interface-test.postman');
+      if (!root) return;
+
+      const responseBody = typeof response.body === 'string' ? response.body : JSON.stringify(response.data || response.body, null, 2);
+
+      // 显示成功状态
+      const statusBar = root.querySelector('.status-bar') || root.querySelector('.ant-tabs-tabpane-active .ant-row');
+      if (statusBar) {
+        const statusBadge = statusBar.querySelector('.ant-badge-status-text');
+        if (statusBadge) {
+          statusBadge.textContent = `HTTP ${response.status}`;
+        }
+      }
+
+      // 创建或更新插件的响应展示
+      let overlay = document.getElementById('crm-file-upload-response');
+      if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'crm-file-upload-response';
+        overlay.style.cssText = 'position:fixed;bottom:20px;right:20px;max-width:500px;max-height:60vh;background:#1a202c;color:#e2e8f0;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,.4);font-family:Monaco,Menlo,monospace;font-size:12px;z-index:999999;display:flex;flex-direction:column;';
+        document.body.appendChild(overlay);
+      }
+
+      overlay.innerHTML = `
+        <div style="padding:10px 14px;background:#2d3748;border-radius:8px 8px 0 0;display:flex;justify-content:space-between;align-items:center;">
+          <span style="color:#68d391;font-weight:bold;">✓ 文件上传成功 (${response.status})</span>
+          <button id="crm-fu-close" style="background:none;border:none;color:#fff;font-size:18px;cursor:pointer;">×</button>
+        </div>
+        <pre style="margin:0;padding:12px;overflow:auto;flex:1;max-height:50vh;white-space:pre-wrap;word-break:break-all;">${escapeHtml(responseBody)}</pre>
+      `;
+
+      const closeBtn = overlay.querySelector('#crm-fu-close');
+      if (closeBtn) closeBtn.addEventListener('click', () => overlay.remove());
+    };
+
+    const displayFileUploadError = (errorMsg) => {
+      let overlay = document.getElementById('crm-file-upload-response');
+      if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'crm-file-upload-response';
+        overlay.style.cssText = 'position:fixed;bottom:20px;right:20px;max-width:500px;background:#1a202c;color:#e2e8f0;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,.4);font-family:Monaco,Menlo,monospace;font-size:12px;z-index:999999;';
+        document.body.appendChild(overlay);
+      }
+      overlay.innerHTML = `
+        <div style="padding:10px 14px;background:#e53e3e;border-radius:8px 8px 0 0;display:flex;justify-content:space-between;align-items:center;">
+          <span style="color:#fff;font-weight:bold;">✗ 文件上传失败</span>
+          <button id="crm-fu-close" style="background:none;border:none;color:#fff;font-size:18px;cursor:pointer;">×</button>
+        </div>
+        <div style="padding:12px;">${escapeHtml(errorMsg)}</div>
+      `;
+      const closeBtn = overlay.querySelector('#crm-fu-close');
+      if (closeBtn) closeBtn.addEventListener('click', () => overlay.remove());
+    };
+
+    const escapeHtml = (text) => {
+      const div = document.createElement('div');
+      div.appendChild(document.createTextNode(String(text || '')));
+      return div.innerHTML;
+    };
+
+    // MutationObserver 检测 YApi 的文件上传限制错误
+    let fileUploadRetrying = false;
+
+    const checkAndHandleFileUploadError = () => {
+      if (fileUploadRetrying) return;
+
+      // 检查是否存在 YApi 的 form-data 文件上传限制错误
+      const root = document.querySelector('.interface-test.postman');
+      if (!root) return;
+
+      // 查找所有 Ant Design 的消息提示、alert、notification 等
+      const candidates = [
+        ...document.querySelectorAll('.ant-message-error'),
+        ...document.querySelectorAll('.ant-notification-notice'),
+        ...document.querySelectorAll('.ant-alert-message'),
+        ...root.querySelectorAll('.ant-form-explain'),
+        ...root.querySelectorAll('.error-msg'),
+        ...root.querySelectorAll('[class*="error"]'),
+        ...root.querySelectorAll('.ant-message-notice-content')
+      ];
+
+      let foundError = false;
+      candidates.forEach((el) => {
+        if (el && isFileUploadError(el)) {
+          foundError = true;
+        }
+      });
+
+      if (!foundError) return;
+
+      fileUploadRetrying = true;
+      debugLog('[Index] 检测到 YApi 文件上传限制，自动重试...');
+
+      // 延迟一帧，确保 DOM 已稳定
+      setTimeout(() => {
+        try {
+          const config = extractRequestConfigFromYapiDom();
+          if (config) {
+            performFileUpload(config);
+
+            // 移除错误提示
+            candidates.forEach((el) => {
+              if (el && isFileUploadError(el)) {
+                try { el.remove(); } catch (e) { /* ignore */ }
+              }
+            });
+
+            // 同时移除 Ant Design 的全局 message 容器
+            document.querySelectorAll('.ant-message').forEach((msg) => {
+              if (msg && isFileUploadError(msg)) {
+                try { msg.remove(); } catch (e) { /* ignore */ }
+              }
+            });
+          } else {
+            console.warn('[Index] 未能从 DOM 提取文件上传配置');
+          }
+        } catch (e) {
+          console.error('[Index] 文件上传拦截器异常:', e.message);
+        } finally {
+          // 允许下次重试
+          setTimeout(() => { fileUploadRetrying = false; }, 2000);
+        }
+      }, 100);
+    };
+
+    // 监听 DOM 变动以检测错误消息
+    const fileUploadObserver = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) {
+          if (node.nodeType === 1) {
+            const text = (node.textContent || '').trim();
+            if (FILE_UPLOAD_ERROR_TEXTS.some((kw) => text.includes(kw))) {
+              checkAndHandleFileUploadError();
+              return;
+            }
+          }
+        }
+      }
+    });
+
+    fileUploadObserver.observe(document.body || document.documentElement, {
+      childList: true,
+      subtree: true,
+      characterData: true
+    });
+
+    debugLog('[Index] YApi 文件上传拦截器已激活');
   }
 
   // 创建标记，表示脚本已加载
